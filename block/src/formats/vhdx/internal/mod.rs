@@ -239,27 +239,9 @@ impl AsRawFd for Vhdx {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command;
-
-    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-
-    /// Generate a small dynamic VHDX with `qemu-img`. Returns `None` (and the
-    /// test is skipped) when `qemu-img` is unavailable, e.g. in minimal CI.
-    fn dynamic_vhdx(size_mib: u64) -> Option<TempFile> {
-        let tf = TempFile::new().unwrap();
-        let path = tf.as_path();
-        let status = Command::new("qemu-img")
-            .args(["create", "-f", "vhdx", "-o", "subformat=dynamic"])
-            .arg(path)
-            .arg(format!("{size_mib}M"))
-            .status();
-        match status {
-            Ok(s) if s.success() => Some(tf),
-            _ => None,
-        }
-    }
+    use crate::formats::vhdx::test_utils::dynamic_vhdx;
 
     /// An unaligned sector write under a forced O_DIRECT alignment must go
     /// through `AlignedFile`'s read-modify-write bounce (the data block and the

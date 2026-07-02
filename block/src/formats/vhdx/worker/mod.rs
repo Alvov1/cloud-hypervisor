@@ -4,4 +4,5 @@
 
 //! Sync I/O worker for VHDX images.
 
+mod common;
 pub(crate) mod sync;
