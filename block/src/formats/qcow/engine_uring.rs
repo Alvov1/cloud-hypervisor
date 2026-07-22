@@ -110,6 +110,9 @@ impl QcowAsync {
         &mut self,
         mut op: AsyncIoOperation,
     ) -> Result<Option<AsyncIoOperation>, Box<(AsyncIoOperation, AsyncIoError)>> {
+        if let Err(e) = op.validate_bounds(self.metadata.virtual_size()) {
+            return Err(Box::new((op, e)));
+        }
         let total_len = op.total_len();
         let host_offset = match Self::resolve_read(
             &self.metadata,
@@ -138,6 +141,9 @@ impl QcowAsync {
         &mut self,
         op: AsyncIoOperation,
     ) -> Result<(), Box<(AsyncIoOperation, AsyncIoError)>> {
+        if let Err(e) = op.validate_bounds(self.metadata.virtual_size()) {
+            return Err(Box::new((op, e)));
+        }
         // TODO Make writes async.
         // Writes are synchronous. Async writes require a multi step
         // state machine for COW (backing read, cluster allocation, data
@@ -611,6 +617,65 @@ mod unit_tests {
             Some(buffer) => buffer.as_slice().to_vec(),
             other => panic!("unexpected read completion: {other:?}"),
         }
+    }
+
+    fn assert_straddling_operation_rejected(is_read: bool) {
+        let virtual_size = 100 * 1024 * 1024;
+        let (_temp, disk) = create_disk_with_data(virtual_size, &[], 0, true);
+        let mut async_io = disk.create_async_io(1).unwrap();
+        let offset = (virtual_size - 512) as libc::off_t;
+        let result = if is_read {
+            async_io.read_to_vec(offset, OwnedIoBuffer::from_vec(vec![0u8; 1024]), 1)
+        } else {
+            async_io.write_from_vec(offset, OwnedIoBuffer::from_vec(vec![0xABu8; 1024]), 1)
+        };
+        match (is_read, result) {
+            (true, Err(AsyncIoError::ReadVectored(_))) => {}
+            (false, Err(AsyncIoError::WriteVectored(_))) => {}
+            (_, other) => panic!("expected a bounds-check error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_read_straddling_virtual_size() {
+        assert_straddling_operation_rejected(true);
+    }
+
+    #[test]
+    fn rejects_write_straddling_virtual_size() {
+        assert_straddling_operation_rejected(false);
+    }
+
+    #[test]
+    fn rejects_batch_request_straddling_virtual_size() {
+        let virtual_size = 100 * 1024 * 1024;
+        let (_temp, disk) = create_disk_with_data(virtual_size, &[], 0, true);
+        let mut async_io = disk.create_async_io(8).unwrap();
+
+        let valid_data = vec![0xAAu8; 4096];
+        let batch = vec![
+            AsyncIoOperation::write_from_vec(0, OwnedIoBuffer::from_vec(valid_data.clone()), 10),
+            AsyncIoOperation::write_from_vec(
+                (virtual_size - 512) as libc::off_t,
+                OwnedIoBuffer::from_vec(vec![0xBBu8; 1024]),
+                20,
+            ),
+        ];
+
+        // The batch itself is accepted; the out-of-bounds op fails as an
+        // individual completion instead of rejecting the whole batch.
+        async_io.submit_batch_requests(batch).unwrap();
+
+        let mut completions = [
+            completion_tuple(&wait_for_completion(async_io.as_mut())),
+            completion_tuple(&wait_for_completion(async_io.as_mut())),
+        ];
+        completions.sort_by_key(|c| c.0);
+        assert_eq!(completions[0], (10, valid_data.len() as i32));
+        assert!(
+            completions[1].1 < 0,
+            "out-of-bounds op should complete with a negative errno result"
+        );
     }
 
     #[test]

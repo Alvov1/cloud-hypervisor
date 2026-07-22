@@ -206,6 +206,7 @@ impl AsyncIo for QcowSync {
     }
 
     fn submit_data_operation(&mut self, mut op: AsyncIoOperation) -> AsyncIoResult<()> {
+        op.validate_bounds(self.metadata.virtual_size())?;
         let is_read = op.is_read();
         let total_len = if is_read {
             self.read_operation(&mut op)?
@@ -487,6 +488,42 @@ mod unit_tests {
         async_io.fsync(Some(7)).unwrap();
         let (user_data, _result) = next_completion(async_io.as_mut());
         assert_eq!(user_data, 7);
+    }
+
+    fn assert_straddling_operation_rejected(is_read: bool) {
+        let virtual_size = 100 * 1024 * 1024;
+        let (_temp, disk) = create_disk_with_data(virtual_size, &[], 0, true, false);
+        let mut async_io = disk.create_async_io(1).unwrap();
+        let offset = (virtual_size - 512) as libc::off_t;
+        let result = if is_read {
+            async_io.read_to_vec(offset, OwnedIoBuffer::from_vec(vec![0u8; 1024]), 1)
+        } else {
+            async_io.write_from_vec(offset, OwnedIoBuffer::from_vec(vec![0xABu8; 1024]), 1)
+        };
+        match (is_read, result) {
+            (true, Err(AsyncIoError::ReadVectored(_))) => {}
+            (false, Err(AsyncIoError::WriteVectored(_))) => {}
+            (_, other) => panic!("expected a bounds-check error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_read_straddling_virtual_size() {
+        assert_straddling_operation_rejected(true);
+    }
+
+    #[test]
+    fn rejects_write_straddling_virtual_size() {
+        assert_straddling_operation_rejected(false);
+    }
+
+    #[test]
+    fn accepts_operation_exactly_filling_virtual_size() {
+        let virtual_size = 4096u64;
+        let data = vec![0xCDu8; virtual_size as usize];
+        let (_temp, disk) = create_disk_with_data(virtual_size, &data, 0, true, false);
+        let read_back = async_read(&disk, 0, virtual_size as usize);
+        assert_eq!(read_back, data);
     }
 
     // Freed relocation clusters must be reused so committed blocks track
